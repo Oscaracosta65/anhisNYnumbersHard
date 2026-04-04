@@ -1,0 +1,1204 @@
+<?php
+/**
+ * LottoExpert.net — SKAI Digit Frequency (Pick 3; content-context safe)
+ * Joomla 5.x + PHP 8.x
+ *
+ * IMPORTANT:
+ * - This version is correct for PICK 3: positions = first, second, third
+ * - Optional extra ball uses "fourth" ONLY if present and populated in the latest row
+ * - Descriptive analysis only (no predictive claims)
+ */
+
+declare(strict_types=1);
+
+defined('_JEXEC') or die;
+
+use Joomla\CMS\Factory;
+use Joomla\CMS\Uri\Uri;
+use Joomla\Database\ParameterType;
+
+$app   = Factory::getApplication();
+$doc   = Factory::getDocument();
+$input = $app->input;
+$db    = Factory::getDbo();
+$user  = Factory::getUser();
+
+// ------------------------------------
+// SEO: canonical + hreflang (Document API)
+// ------------------------------------
+$canonicalUrl = (string) Uri::getInstance()->toString();
+$doc->addCustomTag(
+    '<link rel="canonical" href="' . htmlspecialchars($canonicalUrl, ENT_QUOTES, 'UTF-8') . '" />'
+);
+
+$pathWithQuery = (string) Uri::getInstance()->toString(['path', 'query']);
+$href          = 'https://lottoexpert.net' . $pathWithQuery;
+
+$doc->addCustomTag(
+    '<link rel="alternate" hreflang="en" href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8') . '" />'
+);
+$doc->addCustomTag(
+    '<link rel="alternate" hreflang="x-default" href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8') . '" />'
+);
+
+// ------------------------------------
+// User context (kept for parity)
+// ------------------------------------
+$loginStatus = (int) $user->guest;
+$userPhone   = 'NULL';
+
+if ($loginStatus !== 1) {
+    $userId = (int) $user->get('id');
+
+    $q = $db->getQuery(true)
+        ->select($db->quoteName('profile_value'))
+        ->from($db->quoteName('#__user_profiles'))
+        ->where($db->quoteName('profile_key') . ' = ' . $db->quote('profile.phone'))
+        ->where($db->quoteName('user_id') . ' = :userId');
+
+    $q->bind(':userId', $userId, ParameterType::INTEGER);
+    $db->setQuery($q);
+
+    $tmp = (string) $db->loadResult();
+    if ($tmp !== '') {
+        $userPhone = str_replace(['"', '(', ')'], ['', '', '-'], $tmp);
+    }
+} else {
+    $session      = Factory::getSession();
+    $user_Session = (string) $session->getId();
+}
+
+// ------------------------------------
+// Input: game code (supports legacy params)
+// ------------------------------------
+$gmCodeRaw = (string) $input->getString('gmCode', '');
+if ($gmCodeRaw === '') {
+    $gmCodeRaw = (string) $input->getString('game_id', '');
+}
+if ($gmCodeRaw === '') {
+    $gmCodeRaw = (string) $input->getString('gid', '');
+}
+
+$gId = strtoupper(trim($gmCodeRaw));
+
+if ($gId === '') {
+    http_response_code(400);
+    echo 'Game code is required.';
+    return;
+}
+
+if (!preg_match('/^[A-Z0-9]{3,6}$/', $gId)) {
+    http_response_code(400);
+    echo 'Invalid game code format.';
+    return;
+}
+
+// ------------------------------------
+// Resolve data table (prefix map + safe fallback scan)
+// ------------------------------------
+
+// CHG: "st" is authoritative for your URL format (e.g., ?st=ks&gmCode=KSA).
+$stRaw = strtoupper(trim((string) $input->getString('st', '')));
+$st    = (preg_match('/^[A-Z]{2}$/', $stRaw) === 1) ? $stRaw : '';
+
+// CHG: Numeric game IDs (e.g., "115" for ME/NH/VT) do not encode state; rely on st when present.
+$isNumericGameId = (preg_match('/^[0-9]{3,6}$/', $gId) === 1);
+
+$prefix = '';
+if ($st !== '') {
+    $prefix = $st;
+} elseif (!$isNumericGameId) {
+    $prefix = substr($gId, 0, 2);
+} else {
+    // No st + numeric game id => fall back to full scan below (prefix stays empty).
+    $prefix = '';
+}
+
+$stateTableByPrefix = [
+    // CHG: Full coverage for your actual state list (including numeric game_id 115 states)
+    'AZ' => '#__lotterydb_az',
+    'AR' => '#__lotterydb_ar',
+    'CA' => '#__lotterydb_ca',
+    'CO' => '#__lotterydb_co',
+    'DC' => '#__lotterydb_dc',
+    'DE' => '#__lotterydb_de',
+    'GA' => '#__lotterydb_ga',
+    'ID' => '#__lotterydb_id',
+    'IA' => '#__lotterydb_ia',
+    'KS' => '#__lotterydb_ks',
+    'KY' => '#__lotterydb_ky',
+    'LA' => '#__lotterydb_la',
+    'MD' => '#__lotterydb_md',
+    'MI' => '#__lotterydb_mi',
+    'MN' => '#__lotterydb_mn',
+    'MO' => '#__lotterydb_mo',
+    'NE' => '#__lotterydb_ne',
+    'NM' => '#__lotterydb_nm',
+    'NY' => '#__lotterydb_ny',
+    'OH' => '#__lotterydb_oh',
+    'OK' => '#__lotterydb_ok',
+    'WA' => '#__lotterydb_wa',
+    'WV' => '#__lotterydb_wv',
+    'WI' => '#__lotterydb_wi',
+
+    // CHG: These are required because game_id can be "115" (ME/NH/VT), so we must map by st.
+    'ME' => '#__lotterydb_me',
+    'NH' => '#__lotterydb_nh',
+    'VT' => '#__lotterydb_vt',
+
+    // Keep any legacy extras you had (harmless)
+    'FL' => '#__lotterydb_fl',
+    'MA' => '#__lotterydb_ma',
+    'RI' => '#__lotterydb_ri',
+    'OR' => '#__lotterydb_or',
+];
+
+$candidateTables = array_values(array_unique(array_values($stateTableByPrefix)));
+
+// CHG: Never allow empty table names to enter the probe list (prevents MySQL 1103)
+$candidateTables = array_values(array_filter($candidateTables, static function ($t): bool {
+    return is_string($t) && $t !== '';
+}));
+
+$dbCol       = ($prefix !== '') ? ($stateTableByPrefix[$prefix] ?? '') : '';
+$probeTables = [];
+
+if (is_string($dbCol) && $dbCol !== '') {
+    $probeTables[] = $dbCol;
+}
+
+foreach ($candidateTables as $t) {
+    if (is_string($t) && $t !== '' && !in_array($t, $probeTables, true)) {
+        $probeTables[] = $t;
+    }
+}
+
+$resolvedTable = '';
+foreach ($probeTables as $tbl) {
+    // CHG: Hard guard — never query with an empty table name
+    if (!is_string($tbl) || $tbl === '') {
+        continue;
+    }
+
+    $q = $db->getQuery(true)
+        ->select('COUNT(*)')
+        ->from($db->quoteName($tbl))
+        ->where($db->quoteName('game_id') . ' = :gid');
+
+    $q->bind(':gid', $gId, ParameterType::STRING);
+    $db->setQuery($q);
+
+    if ((int) $db->loadResult() > 0) {
+        $resolvedTable = $tbl;
+        break;
+    }
+}
+
+if ($resolvedTable === '') {
+    http_response_code(404);
+    echo 'Invalid game ID or no history found for this game.';
+    return;
+}
+
+$dbCol = $resolvedTable;
+
+// CHG: Absolute guard — prevents MySQL 1103 “Incorrect table name ''”
+if (!is_string($dbCol) || $dbCol === '') {
+    http_response_code(500);
+    echo 'Internal error: resolved table name is empty.';
+    return;
+}
+
+// ------------------------------------
+// Draw window selection
+// ------------------------------------
+$q = $db->getQuery(true)
+    ->select('COUNT(*)')
+    ->from($db->quoteName($dbCol))
+    ->where($db->quoteName('game_id') . ' = :gid');
+
+$q->bind(':gid', $gId, ParameterType::STRING);
+$db->setQuery($q);
+
+$totalDrawings = (int) $db->loadResult();
+if ($totalDrawings < 1) {
+    http_response_code(404);
+    echo 'No draw history found for this game.';
+    return;
+}
+
+$postedDrawRange = (int) $input->post->getInt('drawRange', 100);
+$minRange        = 10;
+$maxRange        = max($minRange, $totalDrawings);
+
+$drawRange = $postedDrawRange;
+if ($drawRange < $minRange) {
+    $drawRange = $minRange;
+}
+if ($drawRange > $maxRange) {
+    $drawRange = $maxRange;
+}
+
+// ------------------------------------
+// Helpers
+// ------------------------------------
+function leGetPositionFrequencies($db, string $dbCol, string $position, int $drawRange, string $gId): array
+{
+    $q = $db->getQuery(true)
+        ->select($db->quoteName($position))
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = :gid')
+        ->order($db->quoteName('draw_date') . ' DESC')
+        ->setLimit($drawRange);
+
+    $q->bind(':gid', $gId, ParameterType::STRING);
+    $db->setQuery($q);
+
+    $col = $db->loadColumn();
+    if (!is_array($col)) {
+        return [];
+    }
+
+    // Strict sanitation — force values into a single digit 0–9 (Pick 3 positions must be 0–9)
+    $vals = [];
+    foreach ($col as $v) {
+        $s = trim((string) $v);
+
+        if ($s === '' || strcasecmp($s, 'n/a') === 0 || strcasecmp($s, 'null') === 0) {
+            continue;
+        }
+
+        if (preg_match('/^[0-9]$/', $s) === 1) {
+            $vals[] = $s;
+            continue;
+        }
+
+        if (preg_match('/^[0-9]+$/', $s) === 1) {
+            $vals[] = substr($s, -1);
+            continue;
+        }
+
+        if (preg_match('/([0-9])\D*$/', $s, $m) === 1) {
+            $vals[] = (string) $m[1];
+            continue;
+        }
+    }
+
+    if ($vals === []) {
+        return [];
+    }
+
+    return array_count_values($vals);
+}
+
+function leGetDrawsAgoForValue($db, string $dbCol, string $position, string $value, string $gId, int $drawRange): string
+{
+    $q = $db->getQuery(true)
+        ->select('MAX(' . $db->quoteName('draw_date') . ')')
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = :gid')
+        ->where($db->quoteName($position) . ' = :val');
+
+    $q->bind(':gid', $gId, ParameterType::STRING);
+    $q->bind(':val', $value, ParameterType::STRING);
+
+    $db->setQuery($q);
+    $lastDate = (string) $db->loadResult();
+
+    if ($lastDate === '') {
+        return 'Not in last ' . (int) $drawRange . ' dr.';
+    }
+
+    $q = $db->getQuery(true)
+        ->select('COUNT(*)')
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = :gid')
+        ->where($db->quoteName('draw_date') . ' > ' . $db->quote($lastDate));
+
+    $q->bind(':gid', $gId, ParameterType::STRING);
+    $db->setQuery($q);
+
+    return (string) ((int) $db->loadResult()) . ' drws ago';
+}
+
+function leGetOverallComboFrequenciesPick3($db, string $dbCol, int $drawRange, string $gId, bool $includeExtra): array
+{
+    $cols = ['first', 'second', 'third'];
+    if ($includeExtra) {
+        $cols[] = 'fourth';
+    }
+
+    $q = $db->getQuery(true)
+        ->select($db->quoteName($cols))
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = :gid')
+        ->order($db->quoteName('draw_date') . ' DESC')
+        ->setLimit($drawRange);
+
+    $q->bind(':gid', $gId, ParameterType::STRING);
+    $db->setQuery($q);
+
+    $rows = $db->loadObjectList();
+    if (!is_array($rows)) {
+        return [];
+    }
+
+    $freq = [];
+    foreach ($rows as $r) {
+        $combo = (string) $r->first . (string) $r->second . (string) $r->third;
+        if ($includeExtra) {
+            $combo .= (string) $r->fourth;
+        }
+        if (!isset($freq[$combo])) {
+            $freq[$combo] = 0;
+        }
+        $freq[$combo]++;
+    }
+
+    arsort($freq);
+    return $freq;
+}
+
+// ------------------------------------
+// Latest result
+// ------------------------------------
+$q = $db->getQuery(true)
+    ->select('*')
+    ->from($db->quoteName($dbCol))
+    ->where($db->quoteName('game_id') . ' = :gid')
+    ->order($db->quoteName('draw_date') . ' DESC')
+    ->setLimit(1);
+
+$q->bind(':gid', $gId, ParameterType::STRING);
+$db->setQuery($q);
+
+$latest = $db->loadObject();
+if (!is_object($latest)) {
+    http_response_code(404);
+    echo 'No draw history found for this game.';
+    return;
+}
+
+// CHG: Some tables store a numeric "state" (e.g., 1) instead of a label. Never display that.
+// Prefer a human-readable state label; fall back to URL state/prefix if DB value is not usable.
+$rawState = isset($latest->state) ? trim((string) $latest->state) : '';
+
+$stateName = $rawState !== '' ? $rawState : $prefix;
+
+// CHG: If DB "state" is numeric (or otherwise not a name/code), fall back to st/prefix.
+if ($stateName !== '' && preg_match('/^\d+$/', $stateName) === 1) {
+    $stateName = ($st !== '') ? $st : $prefix;
+}
+
+// CHG: If we still only have a 2-letter code, map to a full display name (premium UX).
+$stateLabelMap = [
+    'AL' => 'Alabama', 'AK' => 'Alaska', 'AZ' => 'Arizona', 'AR' => 'Arkansas', 'CA' => 'California',
+    'CO' => 'Colorado', 'CT' => 'Connecticut', 'DC' => 'Washington, DC', 'DE' => 'Delaware', 'FL' => 'Florida',
+    'GA' => 'Georgia', 'HI' => 'Hawaii', 'ID' => 'Idaho', 'IL' => 'Illinois', 'IN' => 'Indiana',
+    'IA' => 'Iowa', 'KS' => 'Kansas', 'KY' => 'Kentucky', 'LA' => 'Louisiana', 'ME' => 'Maine',
+    'MD' => 'Maryland', 'MA' => 'Massachusetts', 'MI' => 'Michigan', 'MN' => 'Minnesota', 'MS' => 'Mississippi',
+    'MO' => 'Missouri', 'MT' => 'Montana', 'NE' => 'Nebraska', 'NV' => 'Nevada', 'NH' => 'New Hampshire',
+    'NJ' => 'New Jersey', 'NM' => 'New Mexico', 'NY' => 'New York', 'NC' => 'North Carolina', 'ND' => 'North Dakota',
+    'OH' => 'Ohio', 'OK' => 'Oklahoma', 'OR' => 'Oregon', 'PA' => 'Pennsylvania', 'RI' => 'Rhode Island',
+    'SC' => 'South Carolina', 'SD' => 'South Dakota', 'TN' => 'Tennessee', 'TX' => 'Texas', 'UT' => 'Utah',
+    'VT' => 'Vermont', 'VA' => 'Virginia', 'WA' => 'Washington', 'WV' => 'West Virginia', 'WI' => 'Wisconsin',
+    'WY' => 'Wyoming',
+];
+
+$stateUpper = strtoupper($stateName);
+if (preg_match('/^[A-Z]{2}$/', $stateUpper) === 1 && isset($stateLabelMap[$stateUpper])) {
+    $stateName = $stateLabelMap[$stateUpper];
+}
+
+$lotteryName = isset($latest->game_name) && (string) $latest->game_name !== '' ? (string) $latest->game_name : $gId;
+
+$draw_date      = isset($latest->draw_date) ? (string) $latest->draw_date : '';
+$next_draw_date = isset($latest->next_draw_date) ? (string) $latest->next_draw_date : '';
+$next_jackpot   = isset($latest->next_jackpot) ? (string) $latest->next_jackpot : '';
+
+$p1 = isset($latest->first)  ? (string) $latest->first  : '';
+$p2 = isset($latest->second) ? (string) $latest->second : '';
+$p3 = isset($latest->third)  ? (string) $latest->third  : '';
+
+$extra    = isset($latest->fourth) ? (string) $latest->fourth : '';
+$hasExtra = ($extra !== '' && strtolower($extra) !== 'n/a');
+
+// Title
+$doc->setTitle('Lottery Digit Analysis — ' . $stateName . ' • ' . $lotteryName . ' | LottoExpert.net');
+
+// ------------------------------------
+// SEO: meta title + description (brand-safe, descriptive; no predictive claims)
+// ------------------------------------
+$metaTitle = 'Pick 3 Digit Frequency — ' . $stateName . ' • ' . $lotteryName . ' (Latest Results + History) | LottoExpert.net';
+
+// Keep description concise (~150–160 chars) and factual.
+$metaDescription = 'Explore Pick 3 digit frequency by position for ' . $stateName . ' ' . $lotteryName
+    . '. View latest verified results plus counts and “draws ago” across the last ' . (int) $drawRange . ' drawings.';
+
+$doc->setTitle($metaTitle);
+$doc->setDescription($metaDescription);
+
+// CHG: Social meta (safe + consistent)
+$doc->setMetaData('og:title', $metaTitle, 'property');
+$doc->setMetaData('og:description', $metaDescription, 'property');
+$doc->setMetaData('og:type', 'website', 'property');
+$doc->setMetaData('twitter:card', 'summary');
+$doc->setMetaData('twitter:title', $metaTitle);
+$doc->setMetaData('twitter:description', $metaDescription);
+
+// ------------------------------------
+// Logo (convention + override map + existence probe)
+// ------------------------------------
+$root        = rtrim(Uri::root(), '/');
+$countryCode = 'us';
+
+$stateCode = '';
+if (preg_match('/_([a-z]{2})$/i', (string) $dbCol, $m)) {
+    $stateCode = strtolower((string) $m[1]);
+} else {
+    $stateCode = strtolower((string) $prefix);
+}
+
+$slugify = static function (string $s): string {
+    $s = strtolower(trim($s));
+    $s = preg_replace('/&amp;|&/i', ' and ', $s);
+    $s = preg_replace('/[^a-z0-9]+/i', '-', $s);
+    $s = preg_replace('/-+/', '-', $s);
+    return trim((string) $s, '-');
+};
+
+$lotterySlug = $slugify($lotteryName);
+
+$logoOverrideByGameId = [
+    // 'NYC' => $root . '/images/lottodb/us/ny/pick-3-day.png',
+];
+
+$logoUrl = '';
+if (isset($logoOverrideByGameId[$gId])) {
+    $logoUrl = (string) $logoOverrideByGameId[$gId];
+} else {
+    if ($stateCode !== '' && $lotterySlug !== '') {
+        $logoUrl = $root . '/images/lottodb/' . $countryCode . '/' . $stateCode . '/' . $lotterySlug . '.png';
+    }
+}
+
+$logoExists = false;
+if ($logoUrl !== '') {
+    $relative = str_replace($root, '', $logoUrl);
+    $relative = ltrim($relative, '/');
+    $absPath  = JPATH_ROOT . '/' . $relative;
+    if (is_file($absPath)) {
+        $logoExists = true;
+    }
+}
+
+// ------------------------------------
+// SKAI CTA link (kept generic + safe)
+// You can override this map per-game if needed, matching your descriptive URL conventions.
+// ------------------------------------
+$aiPathOverrideByGameId = [
+    // 'NYC' => '/pick-3-ai-analysis-new-york?game_id=NYC',
+];
+
+$aiAnalysisHref = '';
+if (isset($aiPathOverrideByGameId[$gId])) {
+    $aiAnalysisHref = $root . (string) $aiPathOverrideByGameId[$gId];
+} else {
+    // CHG: Canonical SKAI AI route + required query key "gameId"
+    $aiAnalysisHref = $root . '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=' . rawurlencode($gId);
+}
+// ------------------------------------
+// Assets: DataTables
+// ------------------------------------
+$doc->addStyleSheet('https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css');
+$doc->addScript('https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js', ['version' => 'auto'], ['defer' => true]);
+$doc->addScript('https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js', ['version' => 'auto'], ['defer' => true]);
+
+?>
+<style>
+:root{
+  --skai-blue:#1C66FF;
+  --navy:#0A1A33;
+  --card:#FFFFFF;
+  --text:#0B1220;
+  --muted:#51607A;
+  --border: rgba(10,26,51,.12);
+  --shadow: 0 10px 25px rgba(10,26,51,.08);
+  --r16:16px;
+  --space-8:8px;
+  --space-12:12px;
+  --space-16:16px;
+  --space-24:24px;
+  --hero: linear-gradient(135deg, #0A1A33 0%, #1C66FF 100%);
+}
+
+.skai-wrap{
+  max-width:1100px;
+  margin:0 auto;
+  padding:var(--space-16);
+  color:var(--text);
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+}
+
+.skai-hero{
+  background: var(--hero);
+  border-radius: var(--r16);
+  padding: var(--space-24);
+  box-shadow: var(--shadow);
+  color:#fff;
+}
+
+.skai-hero-row{
+  display:flex;
+  gap:16px;
+  align-items:center;
+}
+@media (max-width: 780px){
+  .skai-hero-row{ flex-direction:column; align-items:flex-start; }
+}
+
+.skai-hero-logo{
+  width:86px;
+  height:86px;
+  border-radius:18px;
+  background: rgba(255,255,255,.12);
+  border: 1px solid rgba(255,255,255,.18);
+  box-shadow: 0 10px 25px rgba(0,0,0,.10);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  flex: 0 0 auto;
+}
+.skai-hero-logo img{
+  width:72px;
+  height:72px;
+  object-fit:contain;
+  display:block;
+  filter: drop-shadow(0 10px 18px rgba(0,0,0,.20));
+}
+
+.skai-hero h1, .skai-hero h2, .skai-hero h3{ color:#fff !important; }
+.skai-hero p{ color:rgba(255,255,255,.86) !important; }
+
+.skai-kicker{
+  margin:0 0 var(--space-8);
+  font-size:13px;
+  letter-spacing:.2px;
+  color:rgba(255,255,255,.82) !important;
+}
+.skai-title{
+  margin:0 0 var(--space-12);
+  font-size:22px;
+  line-height:1.25;
+}
+.skai-subtitle{
+  margin:0;
+  max-width:72ch;
+  font-size:14px;
+  line-height:1.55;
+}
+
+/* CHG: hero actions to match the upgraded look/structure */
+.skai-hero-actions{
+  margin-top: var(--space-16);
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+  align-items:center;
+}
+.skai-cta{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-weight: 900;
+  text-decoration:none;
+  cursor:pointer;
+  border:1px solid rgba(255,255,255,.28);
+  background: rgba(255,255,255,.14);
+  color:#fff !important;
+}
+.skai-cta:hover{ background: rgba(255,255,255,.18); }
+.skai-cta:focus{
+  outline:3px solid rgba(255,255,255,.35);
+  outline-offset:2px;
+}
+.skai-cta-secondary{
+  background: rgba(10,26,51,.18);
+}
+.skai-cta-badge{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:2px 8px;
+  border-radius:999px;
+  background: rgba(255,255,255,.18);
+  border:1px solid rgba(255,255,255,.22);
+  font-size:12px;
+  font-weight: 900;
+  letter-spacing:.15px;
+}
+
+.skai-card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:var(--r16);
+  box-shadow:var(--shadow);
+  padding:var(--space-16);
+  margin:var(--space-16) 0;
+}
+.skai-card h2{
+  margin:0 0 var(--space-12);
+  font-size:16px;
+  color:var(--navy);
+  font-weight:900;
+}
+
+.result-grid{
+  display:grid;
+  gap:var(--space-12);
+  grid-template-columns: 1fr auto 1fr;
+  align-items:center;
+}
+@media (max-width:780px){
+  .result-grid{ grid-template-columns:1fr; text-align:center; }
+}
+
+.pill{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:34px;
+  height:34px;
+  border-radius:999px;
+  font-weight:800;
+  font-size:14px;
+  color:var(--navy);
+  background: radial-gradient(circle at 30%, #ffffff 0%, #e7e9f2 55%, #d7dbea 100%);
+  border:1px solid rgba(10,26,51,.18);
+  box-shadow:0 6px 14px rgba(10,26,51,.10);
+  margin:4px;
+}
+.pill.extra{
+  color:#fff !important;
+  border:1px solid rgba(255,255,255,.25) !important;
+  background: radial-gradient(circle at 30%, #ffb3b3 0%, #ff4d4d 45%, #c81e1e 75%, #7a0f0f 100%) !important;
+}
+
+.ball-label{
+  display:inline-block;
+  margin-left:6px;
+  font-weight:900;
+  font-size:12px;
+  color:var(--muted);
+}
+
+.controls{
+  display:flex;
+  flex-wrap:wrap;
+  gap:var(--space-12);
+  align-items:center;
+  justify-content:center;
+}
+
+.controls label{ font-weight:900; color:var(--navy); }
+
+.select{
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:10px 12px;
+  background:#fff;
+  min-width:240px;
+}
+
+.btn{
+  border:1px solid rgba(28,102,255,.35);
+  background: linear-gradient(135deg, rgba(28,102,255,.10) 0%, rgba(10,26,51,.02) 100%);
+  color: var(--navy);
+  padding:10px 14px;
+  border-radius:12px;
+  font-weight:900;
+  cursor:pointer;
+}
+
+.btn:focus, .select:focus, a:focus{
+  outline:3px solid rgba(28,102,255,.35);
+  outline-offset:2px;
+}
+
+.help{
+  font-size:13px;
+  color:var(--muted);
+  font-weight:700;
+  line-height:1.45;
+}
+
+.instructions{
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 14px;
+}
+.instructions strong{ color: var(--navy); }
+
+.position-card{
+  margin: var(--space-16) 0 0;
+  padding: var(--space-16);
+  border:1px solid var(--border);
+  border-radius: var(--r16);
+  background: linear-gradient(180deg, rgba(239,239,245,.75) 0%, #FFFFFF 100%);
+}
+.position-title{
+  margin:0 0 var(--space-12);
+  font-size:14px;
+  font-weight:900;
+  color:var(--navy);
+  letter-spacing:.2px;
+}
+
+.digit-grid{
+  display:grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap:10px;
+}
+@media (max-width:700px){
+  .digit-grid{ grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+
+.digit-cell{
+  padding:10px 8px;
+  border:1px solid rgba(10,26,51,.10);
+  border-radius:14px;
+  background:#fff;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  min-height:88px;
+}
+
+.count{
+  font-size:12px;
+  line-height:1.2;
+  color:var(--muted);
+  font-weight:900;
+}
+.bar{
+  width:100%;
+  height:6px;
+  border-radius:999px;
+  background: rgba(10,26,51,.10);
+  overflow:hidden;
+}
+.bar > span{
+  display:block;
+  height:100%;
+  width:0%;
+  background: linear-gradient(135deg, #0A1A33 0%, #1C66FF 100%);
+}
+
+.hi{
+  background: radial-gradient(circle at 30%, #d9fff3 0%, #7fe9c9 50%, #20C997 100%);
+  border-color: rgba(32,201,151,.55);
+}
+.mid{
+  background: radial-gradient(circle at 30%, #fff5df 0%, #ffd08a 55%, #F5A623 100%);
+  border-color: rgba(245,166,35,.55);
+}
+.lo{
+  background: radial-gradient(circle at 30%, #ffe3e3 0%, #ff9a9a 55%, #ff5c5c 100%);
+  border-color: rgba(255,92,92,.55);
+}
+
+.legend{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:center;
+  gap:14px;
+  margin-top: var(--space-12);
+  color: var(--muted);
+  font-size: 13px;
+}
+.legend-dot{
+  width:14px;
+  height:14px;
+  border-radius:999px;
+  display:inline-block;
+  border:1px solid rgba(10,26,51,.15);
+  margin-right:8px;
+}
+
+table{
+  width:100%;
+  border-collapse:collapse;
+  table-layout:fixed;
+}
+th, td{
+  border-bottom:1px solid rgba(10,26,51,.12);
+  padding:10px;
+  text-align:center;
+  vertical-align:middle;
+}
+th{
+  background: rgba(28,102,255,.08);
+  color: var(--navy);
+  font-weight: 900;
+}
+.draws-ago{
+  color: var(--muted);
+  font-weight: 900;
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{ animation:none !important; transition:none !important; scroll-behavior:auto !important; }
+}
+
+.result-wrapper {display: none !important;}
+
+</style>
+
+<div class="skai-wrap" data-skaimodule="digit-frequency">
+  <div class="skai-hero" role="banner" aria-label="Digit frequency analysis header">
+    <div class="skai-hero-row">
+      <?php if ($logoExists && $logoUrl !== '') : ?>
+        <div class="skai-hero-logo" aria-hidden="true">
+          <img
+            src="<?php echo htmlspecialchars((string) $logoUrl, ENT_QUOTES, 'UTF-8'); ?>"
+            alt=""
+            width="86"
+            height="86"
+            loading="lazy"
+            decoding="async"
+            onerror="this.closest('.skai-hero-logo').style.display='none';"
+          >
+        </div>
+      <?php endif; ?>
+
+      <div>
+        <p class="skai-kicker">Digit frequency • SKAI-style visualization</p>
+        <h1 class="skai-title">
+          Lottery Digit Analysis — <?php echo htmlspecialchars((string) $stateName, ENT_QUOTES, 'UTF-8'); ?> • <?php echo htmlspecialchars((string) $lotteryName, ENT_QUOTES, 'UTF-8'); ?>
+        </h1>
+        <p class="skai-subtitle">
+          Begin with the latest verified draw to establish context. From there, use the frequency charts to see which digits have been active, which have cooled off, and which are re-emerging. The tables below add detail—showing exact counts and how recently each digit has appeared—so you can read the recent history before exploring deeper analysis tools.
+        </p>
+
+        <!-- CHG: SKAI CTA (button label includes “SKAI”) -->
+        <div class="skai-hero-actions" aria-label="Primary actions">
+          <a class="skai-cta" href="<?php echo htmlspecialchars((string) $aiAnalysisHref, ENT_QUOTES, 'UTF-8'); ?>">
+            <span class="skai-cta-badge" aria-hidden="true">SKAI</span>
+            <span>Open SKAI AI Analysis</span>
+          </a>
+
+          <a class="skai-cta skai-cta-secondary" href="#latest-results">
+            Jump to latest results
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <section id="latest-results" class="skai-card" aria-label="Latest results">
+    <h2>Latest Results</h2>
+
+    <div class="result-grid">
+      <div>
+        Drawing date:<br>
+        <strong><?php echo $draw_date !== '' ? htmlspecialchars((string) date('m-d-Y', strtotime((string) $draw_date)), ENT_QUOTES, 'UTF-8') : '—'; ?></strong>
+      </div>
+
+      <div aria-label="Latest draw digits">
+        <span class="pill"><?php echo htmlspecialchars((string) $p1, ENT_QUOTES, 'UTF-8'); ?></span>
+        <span class="pill"><?php echo htmlspecialchars((string) $p2, ENT_QUOTES, 'UTF-8'); ?></span>
+        <span class="pill"><?php echo htmlspecialchars((string) $p3, ENT_QUOTES, 'UTF-8'); ?></span>
+
+        <?php if ($hasExtra) : ?>
+          <span class="pill extra"><?php echo htmlspecialchars((string) $extra, ENT_QUOTES, 'UTF-8'); ?></span>
+          <span class="ball-label">Extra Ball</span>
+        <?php endif; ?>
+      </div>
+
+      <div>
+        Next drawing date:<br>
+        <strong><?php echo $next_draw_date !== '' ? htmlspecialchars((string) date('m-d-Y', strtotime((string) $next_draw_date)), ENT_QUOTES, 'UTF-8') : '—'; ?></strong>
+      </div>
+
+      <?php if ($next_jackpot !== '' && strtolower($next_jackpot) !== 'n/a' && (float) $next_jackpot > 0) : ?>
+        <div style="text-align:center;">
+          Next Jackpot<br>
+          <span style="font-weight:900; color: var(--navy);">
+            $<?php echo htmlspecialchars((string) number_format((float) $next_jackpot, 0, '.', ','), ENT_QUOTES, 'UTF-8'); ?>
+          </span>
+        </div>
+      <?php endif; ?>
+    </div>
+  </section>
+
+  <form method="post" class="skai-card" aria-label="Analysis window controls">
+    <h2 style="margin-bottom:10px;">Set Analysis Window</h2>
+    <div class="controls">
+      <label for="drawRange">Draw window (max <?php echo (int) $totalDrawings; ?>)</label>
+      <select class="select" name="drawRange" id="drawRange" aria-describedby="drawRangeHelp">
+        <?php
+        for ($i = 10; $i <= $totalDrawings; $i += 10) {
+            $sel = ($i === $drawRange) ? ' selected="selected"' : '';
+            echo '<option value="' . (int) $i . '"' . $sel . '>' . (int) $i . ' drawings</option>';
+        }
+        ?>
+      </select>
+      <button class="btn" type="submit">Update analysis</button>
+      <span id="drawRangeHelp" class="help">Larger windows reduce noise; smaller windows emphasize recency.</span>
+    </div>
+  </form>
+
+  <div class="skai-card instructions" role="note" aria-label="How to interpret this analysis">
+    <h2>How to interpret this page</h2>
+    <p><strong>What the heatmap shows:</strong> Each cell summarizes how often a digit appears in a specific position across the selected draw window.</p>
+    <p><strong>What the tables show:</strong> The tables list each digit’s count by position and how many draws since it last appeared.</p>
+    <p style="margin-bottom:0;"><strong>Reminder:</strong> This is descriptive distribution analysis — it does not guarantee future outcomes.</p>
+  </div>
+
+  <section class="skai-card" aria-label="Digit distribution heatmaps">
+    <h2>Digit Distribution by Position</h2>
+
+    <div class="controls" style="margin-bottom: var(--space-12);">
+      <label for="heatmapSort">Sort digits by:</label>
+      <select id="heatmapSort" class="select">
+        <option value="digit">Digit (0–9)</option>
+        <option value="high">Most frequent</option>
+        <option value="low">Least frequent</option>
+      </select>
+    </div>
+
+    <?php
+    $positions = [
+        'first'  => 'First Position',
+        'second' => 'Second Position',
+        'third'  => 'Third Position',
+    ];
+
+    foreach ($positions as $posKey => $posLabel) :
+        $freqRaw = leGetPositionFrequencies($db, $dbCol, $posKey, $drawRange, $gId);
+
+        $freq = [];
+        for ($d = 0; $d <= 9; $d++) {
+            $k = (string) $d;
+            $freq[$k] = isset($freqRaw[$k]) ? (int) $freqRaw[$k] : 0;
+        }
+
+        $minFreq = min($freq);
+        $maxFreq = max($freq);
+        $range   = max(1, $maxFreq - $minFreq);
+        ?>
+      <div class="position-card" data-position="<?php echo htmlspecialchars((string) $posKey, ENT_QUOTES, 'UTF-8'); ?>">
+        <div class="position-title"><?php echo htmlspecialchars((string) $posLabel, ENT_QUOTES, 'UTF-8'); ?></div>
+
+        <div class="digit-grid" data-sortgrid="1">
+          <?php foreach ($freq as $digit => $count) :
+              $normalized = ($count - $minFreq) / $range;
+
+              $class = 'lo';
+              if ($normalized >= 0.67) {
+                  $class = 'hi';
+              } elseif ($normalized >= 0.33) {
+                  $class = 'mid';
+              }
+
+              $barWidth = (int) round($normalized * 100);
+              ?>
+            <div class="digit-cell" aria-label="Digit <?php echo (int) $digit; ?> frequency" data-digit="<?php echo (int) $digit; ?>" data-freq="<?php echo (int) $count; ?>">
+              <div class="pill <?php echo $class; ?>" title="<?php echo (int) $count; ?> draws"><?php echo htmlspecialchars((string) $digit, ENT_QUOTES, 'UTF-8'); ?></div>
+              <div class="count"><?php echo (int) $count; ?> draws</div>
+              <div class="bar" aria-hidden="true"><span style="width:<?php echo (int) $barWidth; ?>%"></span></div>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      </div>
+    <?php endforeach; ?>
+
+    <?php if ($hasExtra) :
+        $freqRaw = leGetPositionFrequencies($db, $dbCol, 'fourth', $drawRange, $gId);
+
+        $freq = [];
+        for ($d = 0; $d <= 9; $d++) {
+            $k = (string) $d;
+            $freq[$k] = isset($freqRaw[$k]) ? (int) $freqRaw[$k] : 0;
+        }
+
+        $minFreq = min($freq);
+        $maxFreq = max($freq);
+        $range   = max(1, $maxFreq - $minFreq);
+        ?>
+      <div class="position-card" data-position="extra">
+        <div class="position-title">Extra Ball</div>
+
+        <div class="digit-grid" data-sortgrid="1">
+          <?php foreach ($freq as $digit => $count) :
+              $normalized = ($count - $minFreq) / $range;
+
+              $class = 'lo';
+              if ($normalized >= 0.67) {
+                  $class = 'hi';
+              } elseif ($normalized >= 0.33) {
+                  $class = 'mid';
+              }
+
+              $barWidth = (int) round($normalized * 100);
+              ?>
+            <div class="digit-cell" aria-label="Extra digit <?php echo (int) $digit; ?> frequency" data-digit="<?php echo (int) $digit; ?>" data-freq="<?php echo (int) $count; ?>">
+              <div class="pill <?php echo $class; ?>" title="<?php echo (int) $count; ?> draws"><?php echo htmlspecialchars((string) $digit, ENT_QUOTES, 'UTF-8'); ?></div>
+              <div class="count"><?php echo (int) $count; ?> draws</div>
+              <div class="bar" aria-hidden="true"><span style="width:<?php echo (int) $barWidth; ?>%"></span></div>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <div class="legend" aria-label="Heatmap legend">
+      <span><span class="legend-dot hi"></span>High frequency</span>
+      <span><span class="legend-dot mid"></span>Medium frequency</span>
+      <span><span class="legend-dot lo"></span>Low frequency</span>
+    </div>
+  </section>
+
+  <?php
+  function leRenderPositionTable($db, string $dbCol, string $position, int $drawRange, string $gId, string $title, string $tableId, bool $isExtra = false): void
+  {
+      echo '<section class="skai-card" aria-label="' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '">';
+      echo '<h2>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</h2>';
+      echo '<table id="' . htmlspecialchars($tableId, ENT_QUOTES, 'UTF-8') . '">';
+      echo '<thead><tr><th>Digit</th><th>Drawn Times</th><th>Last Drawn</th></tr></thead><tbody>';
+
+      $freq = leGetPositionFrequencies($db, $dbCol, $position, $drawRange, $gId);
+
+      for ($num = 0; $num <= 9; $num++) {
+          $key   = (string) $num;
+          $count = isset($freq[$key]) ? (int) $freq[$key] : 0;
+          $ago   = leGetDrawsAgoForValue($db, $dbCol, $position, (string) $num, $gId, $drawRange);
+
+          echo '<tr>';
+          echo '<td><div class="pill' . ($isExtra ? ' extra' : '') . '">' . (int) $num . '</div></td>';
+          echo '<td>' . (int) $count . ' ×</td>';
+          echo '<td class="draws-ago">' . htmlspecialchars($ago, ENT_QUOTES, 'UTF-8') . '</td>';
+          echo '</tr>';
+      }
+
+      echo '</tbody></table></section>';
+  }
+
+  leRenderPositionTable($db, $dbCol, 'first',  $drawRange, $gId, 'Detailed Frequency — First Position',  'firstPositionTable');
+  leRenderPositionTable($db, $dbCol, 'second', $drawRange, $gId, 'Detailed Frequency — Second Position', 'secondPositionTable');
+  leRenderPositionTable($db, $dbCol, 'third',  $drawRange, $gId, 'Detailed Frequency — Third Position',  'thirdPositionTable');
+
+  if ($hasExtra) {
+      leRenderPositionTable($db, $dbCol, 'fourth', $drawRange, $gId, 'Detailed Frequency — Extra Ball', 'extraBallTable', true);
+  }
+
+  $overall = leGetOverallComboFrequenciesPick3($db, $dbCol, $drawRange, $gId, $hasExtra);
+  ?>
+
+  <section class="skai-card" aria-label="Overall top combinations">
+    <h2>Top 10 Most Drawn Results (Last <?php echo (int) $drawRange; ?> Drawings)</h2>
+
+    <table id="overallFrequencyTable" class="display">
+      <thead>
+        <tr><th>Number</th><th>Drawn Times</th><th>Note</th></tr>
+      </thead>
+      <tbody>
+        <?php
+        $count = 0;
+        foreach ($overall as $number => $freq) {
+            echo '<tr><td>';
+            foreach (str_split((string) $number) as $digit) {
+                echo '<div class="pill">' . htmlspecialchars($digit, ENT_QUOTES, 'UTF-8') . '</div>';
+            }
+            echo '</td>';
+            echo '<td>' . (int) $freq . ' ×</td>';
+            echo '<td class="draws-ago">Sorted by frequency</td></tr>';
+
+            $count++;
+            if ($count >= 10) {
+                break;
+            }
+        }
+        ?>
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<script>
+(function(){
+  function ready(fn){
+    if (document.readyState === "complete" || document.readyState === "interactive") {
+      setTimeout(fn, 0);
+    } else {
+      document.addEventListener("DOMContentLoaded", fn);
+    }
+  }
+
+  ready(function(){
+    var select = document.getElementById("heatmapSort");
+    if (select) {
+      select.addEventListener("change", function(){
+        var mode = this.value;
+        var grids = document.querySelectorAll(".digit-grid[data-sortgrid='1']");
+
+        for (var i = 0; i < grids.length; i++) {
+          var grid = grids[i];
+          var cells = Array.prototype.slice.call(grid.querySelectorAll(".digit-cell"));
+
+          cells.sort(function(a, b){
+            var af = parseInt(a.getAttribute("data-freq"), 10) || 0;
+            var bf = parseInt(b.getAttribute("data-freq"), 10) || 0;
+
+            if (mode === "high") { return bf - af; }
+            if (mode === "low")  { return af - bf; }
+
+            var ad = parseInt(a.getAttribute("data-digit"), 10) || 0;
+            var bd = parseInt(b.getAttribute("data-digit"), 10) || 0;
+            return ad - bd;
+          });
+
+          for (var c = 0; c < cells.length; c++) {
+            grid.appendChild(cells[c]);
+          }
+        }
+      });
+    }
+
+    function initTable(sel, dir){
+      if (!window.jQuery || !window.jQuery.fn || !window.jQuery.fn.DataTable) { return; }
+      if (window.jQuery(sel).length === 0) { return; }
+      if (window.jQuery(sel).hasClass("dataTable")) { return; }
+
+      window.jQuery(sel).DataTable({
+        "order": [[1, dir]],
+        "paging": false,
+        "bLengthChange": false,
+        "bFilter": false,
+        "bInfo": false
+      });
+    }
+
+    var tries = 0;
+    var timer = setInterval(function(){
+      tries++;
+
+      initTable("#firstPositionTable", "desc");
+      initTable("#secondPositionTable", "desc");
+      initTable("#thirdPositionTable", "desc");
+      initTable("#extraBallTable", "desc");
+      initTable("#overallFrequencyTable", "desc");
+
+      if ((window.jQuery && window.jQuery.fn && window.jQuery.fn.DataTable) || tries >= 20) {
+        clearInterval(timer);
+      }
+    }, 100);
+  });
+})();
+</script>
