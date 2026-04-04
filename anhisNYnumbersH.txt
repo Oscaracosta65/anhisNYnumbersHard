@@ -252,6 +252,17 @@ define('LE_ALLOWED_TABLES', [
     '#__lotterydb_wa', '#__lotterydb_wi', '#__lotterydb_wv',
 ]);
 
+/**
+ * Strip HTML tags, ASCII control characters (except tab/LF/CR), and cap length.
+ * Safe for use in Joomla meta APIs and plain-text contexts.
+ */
+function leSanitizeMetaText(string $text, int $maxLength): string
+{
+    $text = (string) preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $text);
+    $text = strip_tags($text);
+    return mb_substr($text, 0, $maxLength, 'UTF-8');
+}
+
 function leGetPositionFrequencies($db, string $dbCol, string $position, int $drawRange, string $gId): array
 {
     if (!in_array($dbCol, LE_ALLOWED_TABLES, true)) {
@@ -458,13 +469,13 @@ if (preg_match('/^[A-Z]{2}$/', $stateUpper) === 1 && isset($stateLabelMap[$state
 
 $lotteryName = isset($latest->game_name) && (string) $latest->game_name !== '' ? (string) $latest->game_name : $gId;
 // Strip tags, control characters, and cap length — used in Joomla meta APIs and HTML output.
-$lotteryName = mb_substr(strip_tags(preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $lotteryName) ?? ''), 0, 120, 'UTF-8');
+$lotteryName = leSanitizeMetaText($lotteryName, 120);
 if ($lotteryName === '') {
     $lotteryName = $gId;
 }
 
 // Sanitize stateName for meta/title API use (DB-derived path could yield arbitrary text).
-$stateName = mb_substr(strip_tags(preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $stateName) ?? ''), 0, 80, 'UTF-8');
+$stateName = leSanitizeMetaText($stateName, 80);
 
 $draw_date      = isset($latest->draw_date) ? (string) $latest->draw_date : '';
 $next_draw_date = isset($latest->next_draw_date) ? (string) $latest->next_draw_date : '';
