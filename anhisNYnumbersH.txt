@@ -14,14 +14,17 @@ declare(strict_types=1);
 defined('_JEXEC') or die;
 
 use Joomla\CMS\Factory;
+use Joomla\CMS\HTML\HTMLHelper;
+use Joomla\CMS\Session\Session;
 use Joomla\CMS\Uri\Uri;
 use Joomla\Database\ParameterType;
 
-$app   = Factory::getApplication();
-$doc   = Factory::getDocument();
-$input = $app->input;
-$db    = Factory::getDbo();
-$user  = Factory::getUser();
+$app     = Factory::getApplication();
+$doc     = Factory::getDocument();
+$input   = $app->input;
+$db      = Factory::getDbo();
+$user    = Factory::getUser();
+$session = Factory::getSession();
 
 // ------------------------------------
 // SEO: canonical + hreflang (Document API)
@@ -63,9 +66,6 @@ if ($loginStatus !== 1) {
     if ($tmp !== '') {
         $userPhone = str_replace(['"', '(', ')'], ['', '', '-'], $tmp);
     }
-} else {
-    $session      = Factory::getSession();
-    $user_Session = (string) $session->getId();
 }
 
 // ------------------------------------
@@ -200,12 +200,28 @@ if ($resolvedTable === '') {
     return;
 }
 
+// Explicit allowlist guard — resolved table must be a known, hardcoded table.
+if (!in_array($resolvedTable, $candidateTables, true)) {
+    http_response_code(500);
+    echo 'Invalid request parameter.';
+    return;
+}
+
 $dbCol = $resolvedTable;
 
 // CHG: Absolute guard — prevents MySQL 1103 “Incorrect table name ''”
 if (!is_string($dbCol) || $dbCol === '') {
     http_response_code(500);
     echo 'Internal error: resolved table name is empty.';
+    return;
+}
+
+// ------------------------------------
+// CSRF protection for state-changing POST
+// ------------------------------------
+if ($input->getMethod() === 'POST' && !Session::checkToken()) {
+    http_response_code(403);
+    echo 'Access denied.';
     return;
 }
 
@@ -242,8 +258,15 @@ if ($drawRange > $maxRange) {
 // ------------------------------------
 // Helpers
 // ------------------------------------
+// Shared allowlist for DB column name (position) parameters.
+define('LE_ALLOWED_POSITIONS', ['first', 'second', 'third', 'fourth']);
+
 function leGetPositionFrequencies($db, string $dbCol, string $position, int $drawRange, string $gId): array
 {
+    if (!in_array($position, LE_ALLOWED_POSITIONS, true)) {
+        return [];
+    }
+
     $q = $db->getQuery(true)
         ->select($db->quoteName($position))
         ->from($db->quoteName($dbCol))
@@ -293,6 +316,10 @@ function leGetPositionFrequencies($db, string $dbCol, string $position, int $dra
 
 function leGetDrawsAgoForValue($db, string $dbCol, string $position, string $value, string $gId, int $drawRange): string
 {
+    if (!in_array($position, LE_ALLOWED_POSITIONS, true)) {
+        return 'Not in last ' . $drawRange . ' dr.';
+    }
+
     $q = $db->getQuery(true)
         ->select('MAX(' . $db->quoteName('draw_date') . ')')
         ->from($db->quoteName($dbCol))
@@ -313,9 +340,10 @@ function leGetDrawsAgoForValue($db, string $dbCol, string $position, string $val
         ->select('COUNT(*)')
         ->from($db->quoteName($dbCol))
         ->where($db->quoteName('game_id') . ' = :gid')
-        ->where($db->quoteName('draw_date') . ' > ' . $db->quote($lastDate));
+        ->where($db->quoteName('draw_date') . ' > :lastDate');
 
     $q->bind(':gid', $gId, ParameterType::STRING);
+    $q->bind(':lastDate', $lastDate, ParameterType::STRING);
     $db->setQuery($q);
 
     return (string) ((int) $db->loadResult()) . ' drws ago';
@@ -363,7 +391,7 @@ function leGetOverallComboFrequenciesPick3($db, string $dbCol, int $drawRange, s
 // Latest result
 // ------------------------------------
 $q = $db->getQuery(true)
-    ->select('*')
+    ->select($db->quoteName(['state', 'game_name', 'draw_date', 'next_draw_date', 'next_jackpot', 'first', 'second', 'third', 'fourth']))
     ->from($db->quoteName($dbCol))
     ->where($db->quoteName('game_id') . ' = :gid')
     ->order($db->quoteName('draw_date') . ' DESC')
@@ -461,10 +489,10 @@ if (preg_match('/_([a-z]{2})$/i', (string) $dbCol, $m)) {
 
 $slugify = static function (string $s): string {
     $s = strtolower(trim($s));
-    $s = preg_replace('/&amp;|&/i', ' and ', $s);
-    $s = preg_replace('/[^a-z0-9]+/i', '-', $s);
-    $s = preg_replace('/-+/', '-', $s);
-    return trim((string) $s, '-');
+    $s = (string) preg_replace('/&amp;|&/i', ' and ', $s);
+    $s = (string) preg_replace('/[^a-z0-9]+/i', '-', $s);
+    $s = (string) preg_replace('/-+/', '-', $s);
+    return trim($s, '-');
 };
 
 $lotterySlug = $slugify($lotteryName);
@@ -486,8 +514,18 @@ $logoExists = false;
 if ($logoUrl !== '') {
     $relative = str_replace($root, '', $logoUrl);
     $relative = ltrim($relative, '/');
-    $absPath  = JPATH_ROOT . '/' . $relative;
-    if (is_file($absPath)) {
+    $absPath  = JPATH_ROOT . DIRECTORY_SEPARATOR . $relative;
+    $realPath = realpath($absPath);
+    $rootReal = realpath(JPATH_ROOT);
+    // Prevent path traversal: resolved path must reside inside JPATH_ROOT.
+    // stripos handles case-insensitive filesystems (e.g. Windows) safely;
+    // realpath already normalises casing on any platform.
+    if (
+        $realPath !== false &&
+        $rootReal !== false &&
+        stripos($realPath, $rootReal . DIRECTORY_SEPARATOR) === 0 &&
+        is_file($realPath)
+    ) {
         $logoExists = true;
     }
 }
@@ -907,7 +945,10 @@ th{
     <div class="result-grid">
       <div>
         Drawing date:<br>
-        <strong><?php echo $draw_date !== '' ? htmlspecialchars((string) date('m-d-Y', strtotime((string) $draw_date)), ENT_QUOTES, 'UTF-8') : '—'; ?></strong>
+        <strong><?php
+            $_ts = ($draw_date !== '') ? strtotime((string) $draw_date) : false;
+            echo ($_ts !== false) ? htmlspecialchars((string) date('m-d-Y', $_ts), ENT_QUOTES, 'UTF-8') : '—';
+        ?></strong>
       </div>
 
       <div aria-label="Latest draw digits">
@@ -923,7 +964,10 @@ th{
 
       <div>
         Next drawing date:<br>
-        <strong><?php echo $next_draw_date !== '' ? htmlspecialchars((string) date('m-d-Y', strtotime((string) $next_draw_date)), ENT_QUOTES, 'UTF-8') : '—'; ?></strong>
+        <strong><?php
+            $_ts2 = ($next_draw_date !== '') ? strtotime((string) $next_draw_date) : false;
+            echo ($_ts2 !== false) ? htmlspecialchars((string) date('m-d-Y', $_ts2), ENT_QUOTES, 'UTF-8') : '—';
+        ?></strong>
       </div>
 
       <?php if ($next_jackpot !== '' && strtolower($next_jackpot) !== 'n/a' && (float) $next_jackpot > 0) : ?>
@@ -938,6 +982,7 @@ th{
   </section>
 
   <form method="post" class="skai-card" aria-label="Analysis window controls">
+    <?php echo HTMLHelper::_('form.token'); ?>
     <h2 style="margin-bottom:10px;">Set Analysis Window</h2>
     <div class="controls">
       <label for="drawRange">Draw window (max <?php echo (int) $totalDrawings; ?>)</label>
@@ -1068,6 +1113,10 @@ th{
   <?php
   function leRenderPositionTable($db, string $dbCol, string $position, int $drawRange, string $gId, string $title, string $tableId, bool $isExtra = false): void
   {
+      if (!in_array($position, LE_ALLOWED_POSITIONS, true)) {
+          return;
+      }
+
       echo '<section class="skai-card" aria-label="' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '">';
       echo '<h2>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</h2>';
       echo '<table id="' . htmlspecialchars($tableId, ENT_QUOTES, 'UTF-8') . '">';
