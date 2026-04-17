@@ -443,8 +443,9 @@ function leGetDrawingsSinceDate(
         ->where($db->quoteName('game_id') . ' = :gameId')
         ->where($db->quoteName('draw_date') . ' > :previousDate')
         ->where($db->quoteName('draw_date') . ' < :currentDate');
+    $previousDateStr = (string) $previousDate;
     $query->bind(':gameId', $gameId, ParameterType::STRING);
-    $query->bind(':previousDate', (string) $previousDate, ParameterType::STRING);
+    $query->bind(':previousDate', $previousDateStr, ParameterType::STRING);
     $query->bind(':currentDate', $currentDate, ParameterType::STRING);
 
     $db->setQuery($query);
