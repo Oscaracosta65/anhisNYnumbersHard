@@ -152,7 +152,7 @@ $loginStatus = (int) ($user->guest ?? 1);
 
 if ($loginStatus === 1) {
     $session = Factory::getSession();
-    $userSession = $session->getId();
+    $_userSession = $session->getId();
 } else {
     $userId = (int) $user->id;
 
@@ -160,7 +160,8 @@ if ($loginStatus === 1) {
         ->select($db->quoteName('profile_value'))
         ->from($db->quoteName('#__user_profiles'))
         ->where($db->quoteName('profile_key') . ' = ' . $db->quote('profile.phone'))
-        ->where($db->quoteName('user_id') . ' = ' . (int) $userId);
+        ->where($db->quoteName('user_id') . ' = :userId');
+    $profileQuery->bind(':userId', $userId, ParameterType::INTEGER);
 
     $db->setQuery($profileQuery);
     $userPhone = (string) $db->loadResult();
@@ -381,8 +382,9 @@ function leFetchRecentDraws(\Joomla\Database\DatabaseDriver $db, string $dbCol, 
     $query = $db->getQuery(true)
         ->select('*')
         ->from($db->quoteName($dbCol))
-        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->where($db->quoteName('game_id') . ' = :gameId')
         ->order($db->quoteName('draw_date') . ' DESC');
+    $query->bind(':gameId', $gameId, ParameterType::STRING);
 
     $db->setQuery($query, 0, $limit);
     $rows = $db->loadAssocList();
@@ -405,8 +407,10 @@ function leGetPreviousOccurrenceDate(
     $query = $db->getQuery(true)
         ->select('MAX(' . $db->quoteName('draw_date') . ')')
         ->from($db->quoteName($dbCol))
-        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
-        ->where($db->quoteName('draw_date') . ' < ' . $db->quote($drawDate));
+        ->where($db->quoteName('game_id') . ' = :gameId')
+        ->where($db->quoteName('draw_date') . ' < :drawDate');
+    $query->bind(':gameId', $gameId, ParameterType::STRING);
+    $query->bind(':drawDate', $drawDate, ParameterType::STRING);
 
     $parts = [];
     foreach ($columns as $col) {
@@ -436,23 +440,17 @@ function leGetDrawingsSinceDate(
     $query = $db->getQuery(true)
         ->select('COUNT(' . $db->quoteName('id') . ')')
         ->from($db->quoteName($dbCol))
-        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
-        ->where($db->quoteName('draw_date') . ' > ' . $db->quote($previousDate))
-        ->where($db->quoteName('draw_date') . ' < ' . $db->quote($currentDate));
+        ->where($db->quoteName('game_id') . ' = :gameId')
+        ->where($db->quoteName('draw_date') . ' > :previousDate')
+        ->where($db->quoteName('draw_date') . ' < :currentDate');
+    $query->bind(':gameId', $gameId, ParameterType::STRING);
+    $query->bind(':previousDate', (string) $previousDate, ParameterType::STRING);
+    $query->bind(':currentDate', $currentDate, ParameterType::STRING);
 
     $db->setQuery($query);
     $count = (int) $db->loadResult();
 
     return $count + 1;
-}
-
-function leEscapeJsString(string $value): string
-{
-    return str_replace(
-        ["\\", "'", "\r", "\n", '</'],
-        ["\\\\", "\\'", '', '', '<\/'],
-        $value
-    );
 }
 
 /**
@@ -797,8 +795,8 @@ $schemaDataset = [
     'description' => 'Frequency and recency analysis over recent draw history windows for ' . $gName,
     'keywords' => [$gName, 'lottery results analysis', 'frequency', 'active numbers', 'quiet numbers', 'draw history'],
 ];
-$doc->addCustomTag('<script type=\"application/ld+json\">' . json_encode($schemaWebPage, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . '</script>');
-$doc->addCustomTag('<script type=\"application/ld+json\">' . json_encode($schemaDataset, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . '</script>');
+$doc->addCustomTag('<script type=\"application/ld+json\">' . json_encode($schemaWebPage, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . '</script>');
+$doc->addCustomTag('<script type=\"application/ld+json\">' . json_encode($schemaDataset, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . '</script>');
 ?>
 <style>
 :root{
@@ -1798,7 +1796,8 @@ table.skai-table tbody tr:hover{
               decoding="async"
             >
           <?php else : ?>
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" aria-label="Lottery game logo placeholder" role="img">
+              <title>Lottery game logo placeholder</title>
               <path d="M12 2l2.7 6.2L21 9l-4.7 4.1L17.6 21 12 17.8 6.4 21l1.3-7.9L3 9l6.3-.8L12 2z" stroke="rgba(10,26,51,.55)" stroke-width="1.6" stroke-linejoin="round"/>
             </svg>
           <?php endif; ?>
@@ -2100,20 +2099,21 @@ table.skai-table tbody tr:hover{
           <div class="skai-controls-left">
             <label for="nod">Main-number draw window</label>
             <select name="nod" id="nod" class="skai-select">
-              <?php foreach (range(10, 700, 5) as $opt) : ?>
-                <option value="<?php echo (int) $opt; ?>"<?php echo ((int) $opt === (int) $nodCurrentMain) ? ' selected="selected"' : ''; ?>>
-                  <?php echo (int) $opt; ?>
-                </option>
-              <?php endforeach; ?>
+              <?php
+              $windowStep = ($totalDrawings > 250) ? 10 : 5;
+              for ($opt = 10; $opt <= $totalDrawings; $opt += $windowStep) :
+              ?>
+                <option value="<?php echo (int) $opt; ?>"<?php echo ((int) $opt === (int) $nodCurrentMain) ? ' selected="selected"' : ''; ?>><?php echo (int) $opt; ?></option>
+              <?php endfor; ?>
             </select>
 
             <label for="pnod">Bonus draw window</label>
             <select name="pnod" id="pnod" class="skai-select">
-              <?php foreach (range(10, 700, 5) as $opt) : ?>
-                <option value="<?php echo (int) $opt; ?>"<?php echo ((int) $opt === (int) $nodCurrentStar) ? ' selected="selected"' : ''; ?>>
-                  <?php echo (int) $opt; ?>
-                </option>
-              <?php endforeach; ?>
+              <?php
+              for ($opt = 10; $opt <= $totalDrawings; $opt += $windowStep) :
+              ?>
+                <option value="<?php echo (int) $opt; ?>"<?php echo ((int) $opt === (int) $nodCurrentStar) ? ' selected="selected"' : ''; ?>><?php echo (int) $opt; ?></option>
+              <?php endfor; ?>
             </select>
           </div>
 
@@ -2363,30 +2363,26 @@ table.skai-table tbody tr:hover{
     }
 
     var cdnUrl = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
-    var integrity = 'sha384-OLBgp1GsljhM2TJ+sbHjaiH9txEUvgdDTAzHv2P24donTt6/529l+9Ua0vFImLlb';
+    var doneCalled = false;
 
-    function tryLoad(withIntegrity) {
-      var script = document.createElement('script');
-      script.src = cdnUrl;
-      if (withIntegrity) {
-        script.integrity = integrity;
-        script.crossOrigin = 'anonymous';
+    function doneOnce() {
+      if (doneCalled) {
+        return;
       }
-      script.async = true;
-      script.onload = function () {
-        done();
-      };
-      script.onerror = function () {
-        if (withIntegrity) {
-          tryLoad(false);
-        } else {
-          done();
-        }
-      };
-      document.head.appendChild(script);
+      doneCalled = true;
+      done();
     }
 
-    tryLoad(true);
+    var script = document.createElement('script');
+    script.src = cdnUrl;
+    script.async = true;
+    script.onload = function () {
+      doneOnce();
+    };
+    script.onerror = function () {
+      doneOnce();
+    };
+    document.head.appendChild(script);
   }
 
   function commonBarOptions(horizontal) {
@@ -2680,6 +2676,19 @@ table.skai-table tbody tr:hover{
         tries++;
         if (renderCharts() || tries >= 30) {
           clearInterval(timer);
+          if (tries >= 30) {
+            var frames = document.querySelectorAll('.skai-chart-frame');
+            for (var i = 0; i < frames.length; i++) {
+              if (!frames[i].getAttribute('data-chart-fallback')) {
+                frames[i].setAttribute('data-chart-fallback', '1');
+                var note = document.createElement('div');
+                note.className = 'skai-note';
+                note.style.marginTop = '8px';
+                note.textContent = 'Chart data is available, but this chart could not render in the current browser state.';
+                frames[i].appendChild(note);
+              }
+            }
+          }
         }
       }, 150);
     });
